@@ -1,8 +1,10 @@
-from fastapi import FastAPI, Depends, Security, HTTPException, BackgroundTasks, Body
+from fastapi import FastAPI, Depends, Security, HTTPException, BackgroundTasks, Body, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from typing import Optional
+import time
 
 from sqlalchemy.orm import Session
 from stockfish import Stockfish
@@ -54,7 +56,7 @@ app.add_middleware(
 
 load_dotenv()
 
-STOCKFISH_PATH = r"C:\Users\joao.silva\OneDrive - Allparts Componentes Ltda\Documentos\GitHub\Pychess-API\stockfish\stockfish-windows-x86-64-avx2.exe"
+STOCKFISH_PATH = r"C:\Users\liandra.meirelles\OneDrive - GOLDEN GOAL SPORTS VENTURES GESTÃO ESPORTIVA LTDA\Documentos\TCC\robo_tcc\Pychess-API-Robo\stockfish\stockfish-windows-x86-64-avx2.exe"
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
 
@@ -476,60 +478,207 @@ def calculate_and_save_evaluation(game_id: int, db: Session):
     db.commit()
 
 # ROTAS A SEREM USADAS AO PENSAR EM INTEGRAR COM O ROBO
-@app.get("/get_position/{square}", tags=['ROBOT'])
-def get_move_vector(move: str):
-    """
-    Recebe uma jogada como 'h2h3' e retorna o deslocamento em X, Y
-    e o ângulo inteiro que o robô deve girar a partir da posição 0 (referência horizontal).
-    """
+# ---------- utilitárias ----------
+def get_position(square: str):
+    if len(square) != 2 or square[0] not in "abcdefgh" or square[1] not in "12345678":
+        raise HTTPException(status_code=400, detail=f"Posição inválida: {square}")
+    column_map = {"a":1000,"b":2000,"c":3000,"d":4000,"e":5000,"f":6000,"g":7000,"h":8000}
+    row_map    = {"1":1000,"2":2000,"3":3000,"4":4000,"5":5000,"6":6000,"7":7000,"8":8000}
+    return column_map[square[0]], row_map[square[1]]
 
+def compute_move_vector(move: str):
+    print(f"[DEBUG] Recebendo jogada: {move}")
     if len(move) != 4:
         raise HTTPException(status_code=400, detail="Jogada inválida! Use formato padrão, ex: 'h2h3'.")
-
-    from_square = move[:2]
-    to_square = move[2:]
-
-    def get_position(square: str):
-        if len(square) != 2 or square[0] not in "abcdefgh" or square[1] not in "12345678":
-            raise HTTPException(status_code=400, detail=f"Posição inválida: {square}")
-
-        column_map = {
-            "a": 1000, "b": 2000, "c": 3000, "d": 4000,
-            "e": 5000, "f": 6000, "g": 7000, "h": 8000
-        }
-
-        row_map = {
-            "1": 1000, "2": 2000, "3": 3000, "4": 4000,
-            "5": 5000, "6": 6000, "7": 7000, "8": 8000
-        }
-
-        x = column_map[square[0]]
-        y = row_map[square[1]]
-        return (x, y)
-
-    # Posições de origem e destino
-    x1, y1 = get_position(from_square)
-    x2, y2 = get_position(to_square)
-
-    # Vetor de deslocamento
+    from_sq, to_sq = move[:2], move[2:]
+    x1, y1 = get_position(from_sq)
+    x2, y2 = get_position(to_sq)
     dx = x2 - x1
     dy = y2 - y1
-
-    # Ângulo absoluto (em relação ao eixo X positivo) — referência 0°
-    angle_rad = math.atan2(dy, dx)
-    angle_deg = int(round(math.degrees(angle_rad)))
-
-    # Corrige ângulos negativos para o intervalo 0°–359°
+    angle_deg = int(round(math.degrees(math.atan2(dy, dx))))
     if angle_deg < 0:
         angle_deg += 360
+    print(f"[DEBUG] Vetor calculado -> dx={dx}, dy={dy}, ângulo={angle_deg}°")
+    return {"from": from_sq, "to": to_sq, "dx": dx, "dy": dy, "angle_deg": angle_deg}
 
-    return {
-        "from": from_square,
-        "to": to_square,
-        "dx": dx,
-        "dy": dy,
-        "angle_deg": angle_deg  # usado sempre a partir da posição 0
+def units_to_steps(delta_units: int, steps_per_square: float):
+    steps = int(round(abs(delta_units) / 1000.0 * steps_per_square))
+    print(f"[DEBUG] Convertendo {delta_units} unidades -> {steps} passos (1 casa = {steps_per_square} passos)")
+    return steps
+
+# ---------- wait_response_until_ok (espera OK) ----------
+def wait_response_until_ok(ser, timeout_s: float):
+    """
+    Lê linhas até receber exatamente 'OK' (ou 'OK ...'). Retorna todas as linhas lidas.
+    Ignora banners genéricos do boot. Retorna None em timeout.
+    """
+    print(f"[DEBUG] Aguardando 'OK' do Arduino (timeout={timeout_s}s)...")
+    deadline = time.time() + timeout_s
+    lines = []
+    while time.time() < deadline:
+        try:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            line = ""
+        if not line:
+            continue
+        lines.append(line)
+        print(f"[ARDUINO] {line}")
+        up = line.upper()
+        # ignorar banners comuns do boot (ajuste conforme necessário)
+        if "TESTE INICIADO" in up or "AGUARDANDO COMANDOS" in up or "RAMPS" in up or "COMANDOS" in up:
+            print("[DEBUG] Linha identificada como banner; ignorando.")
+            continue
+        # aceitar OK explícito como fim do pacote para esse comando
+        if up == "OK" or up.startswith("OK "):
+            return lines
+        # se seu sketch nunca envia OK, considere aceitar 'RECEBIDO:' também,
+        # mas aqui queremos garantir que tanto 'Recebido:' quanto 'OK' sejam coletados.
+    print("[DEBUG] Timeout: sem 'OK' do Arduino.")
+    return None
+
+# ---------- serial send (X then Y, sem SYNC) ----------
+def send_serial_commands(port: str,
+                         dx: int, dy: int,
+                         steps_per_square: float = 2000.0,
+                         read_timeout: float = 5.0):
+    """
+    Envia X então Y sequencialmente. Não usa SYNC.
+    Imprime as strings que seriam enviadas antes de tentar abrir a porta.
+    Faz drenagem do buffer APÓS aguardar boot do Arduino.
+    Usa flush() + pequeno sleep após cada write para sincronização.
+    Retorna lista de dicts {'cmd': ..., 'response': [...] } ou levanta RuntimeError.
+    """
+    print(f"[DEBUG] Preparando envio para porta {port}...")
+    steps_x = units_to_steps(dx, steps_per_square)
+    steps_y = units_to_steps(dy, steps_per_square)
+    dir_x = "F" if dx > 0 else "B" if dx < 0 else None
+    dir_y = "F" if dy > 0 else "B" if dy < 0 else None
+
+    print(f"[DEBUG] Comandos que seriam enviados → "
+          f"{'X: ' + dir_x + ' X ' + str(steps_x) if dir_x and steps_x > 0 else 'X: nenhum'} | "
+          f"{'Y: ' + dir_y + ' Y ' + str(steps_y) if dir_y and steps_y > 0 else 'Y: nenhum'}")
+
+    ser = None
+    sent = []
+    try:
+        try:
+            ser = serial.Serial(port, 115200, timeout=0.1)
+            # aguarda o Arduino reiniciar e emitir banner
+            boot_wait = 1.0
+            print(f"[DEBUG] Porta {port} aberta. Aguardando {boot_wait}s para boot do Arduino...")
+            time.sleep(boot_wait)
+
+            # drenar buffer após o boot
+            try:
+                ser.reset_input_buffer()
+                print("[DEBUG] Buffer de entrada reiniciado (reset_input_buffer).")
+            except Exception:
+                t0 = time.time()
+                while time.time() - t0 < 0.3:
+                    if ser.in_waiting:
+                        _ = ser.readline()
+                    else:
+                        time.sleep(0.01)
+                print("[DEBUG] Buffer de entrada drenado via leitura (fallback).")
+            print(f"[DEBUG] Porta {port} pronta para envio.")
+        except serial.SerialException as e:
+            print(f"[ERRO] Não foi possível abrir {port}: {e}")
+            raise RuntimeError(f"Não foi possível abrir porta {port}: {e}")
+
+        # enviar X se necessário
+        if steps_x > 0 and dir_x:
+            cmdx = f"{dir_x} X {steps_x}\n"
+            print(f"[DEBUG] Enviando comando X: {cmdx.strip()}")
+            ser.write(cmdx.encode())
+            try:
+                ser.flush()
+            except Exception:
+                pass
+            time.sleep(0.02)  # 20 ms para o Arduino começar a processar
+            resp = wait_response_until_ok(ser, read_timeout)
+            if resp is None:
+                raise RuntimeError(f"Sem resposta 'OK' do Arduino para comando X: '{cmdx.strip()}'")
+            sent.append({"cmd": cmdx.strip(), "response": resp})
+
+        # enviar Y se necessário
+        if steps_y > 0 and dir_y:
+            cmdy = f"{dir_y} Y {steps_y}\n"
+            print(f"[DEBUG] Enviando comando Y: {cmdy.strip()}")
+            ser.write(cmdy.encode())
+            try:
+                ser.flush()
+            except Exception:
+                pass
+            time.sleep(0.02)
+            resp = wait_response_until_ok(ser, read_timeout)
+            if resp is None:
+                raise RuntimeError(f"Sem resposta 'OK' do Arduino para comando Y: '{cmdy.strip()}'")
+            sent.append({"cmd": cmdy.strip(), "response": resp})
+
+        print("[DEBUG] Comandos enviados com sucesso.")
+        return sent
+
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+                print("[DEBUG] Porta serial encerrada.")
+            except Exception:
+                print("[DEBUG] Falha ao fechar porta serial (ignorado).")
+
+# ---------- endpoint ----------
+@app.get("/get_position/{move}", tags=["ROBOT"])
+def get_move_vector_endpoint(
+    move: str,
+    send: bool = Query(False, description="Se true, envia comandos ao Arduino via serial"),
+    port: Optional[str] = Query(None, description="Porta serial ex: /dev/ttyUSB0 ou COM3 (necessário se send=true)"),
+    steps_per_square: float = Query(2000.0, description="Passos correspondentes a 1 casa (1000 unidades)"),
+    read_timeout: float = Query(5.0, description="Timeout de leitura em segundos")
+):
+    """
+    Recebe uma jogada como 'h2h3' e retorna dx, dy e angle_deg.
+    Se `send=true`, envia X então Y para o Arduino (requer 'port').
+    """
+    print("=" * 60)
+    print(f"[INFO] Requisição recebida: move={move}, send={send}, port={port}")
+    print(f"[INFO] Parâmetros: steps_per_square={steps_per_square}, read_timeout={read_timeout}")
+
+    mv = compute_move_vector(move)
+
+    result = {
+        "from": mv["from"],
+        "to": mv["to"],
+        "dx": mv["dx"],
+        "dy": mv["dy"],
+        "angle_deg": mv["angle_deg"]
     }
+
+    if send:
+        if not port:
+            raise HTTPException(status_code=400, detail="Parâmetro 'port' requerido quando send=true.")
+        try:
+            print("[INFO] Enviando comandos ao Arduino...")
+            sent = send_serial_commands(port=port,
+                                        dx=mv["dx"],
+                                        dy=mv["dy"],
+                                        steps_per_square=steps_per_square,
+                                        read_timeout=read_timeout)
+            result["sent"] = sent
+            print("[INFO] Movimento concluído com sucesso.")
+        except RuntimeError as e:
+            print(f"[ERRO] Timeout ou falha de resposta: {e}")
+            raise HTTPException(status_code=504, detail=str(e))
+        except serial.SerialException as e:
+            print(f"[ERRO] Erro na porta serial: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro serial: {e}")
+
+    print(f"[INFO] Resultado final: {result}")
+    print("=" * 60)
+    return result
+
+
+
 
 def read_board_matrix_serial(port='COM3', baudrate=9600):
     ser = serial.Serial(port, baudrate, timeout=2)
