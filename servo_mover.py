@@ -29,3 +29,7 @@ def send_servo_command(command: str):
         servo_serial.write(msg.encode("utf-8"))
         servo_serial.flush()
         time.sleep(0.5)  # pequena pausa para garantir execução no Arduino
+
+while True:
+    comando = input("Digite o comando (abrir ou fechar)")
+    send_servo_command(comando)

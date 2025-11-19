@@ -31,6 +31,8 @@ import os
 import chess
 import serial
 
+import servo_mover as sm
+
 app = FastAPI(
     title="Pychess",
     description="API com autenticação JWT",
@@ -607,9 +609,13 @@ def get_move_vector_endpoint(
         for move_cmd in moves_go:
             seq_go_responses.append(send_move(move_cmd))
 
+        sm.send_servo_command("open")
+
         print("[INFO] Iniciando sequência de volta (E1 → X → Y)...")
         for move_cmd in moves_back:
             seq_back_responses.append(send_move(move_cmd))
+
+        sm.send_servo_command("close")
 
         result["sequence_go"] = seq_go_responses
         result["sequence_back"] = seq_back_responses
