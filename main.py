@@ -32,6 +32,7 @@ import chess
 import serial
 
 import servo_mover as sm
+import EXAMPLE_PLAY as ep
 
 app = FastAPI(
     title="Pychess",
@@ -439,6 +440,8 @@ async def play_game(move: str, background_tasks: BackgroundTasks, db: Session = 
             }
         
     background_tasks.add_task(calculate_and_save_evaluation, game.id, db)
+
+    ep.exampleMove() # Rodando o exemplo de movimento do robo
 
     return {
         "message": "Movimentos realizados!",

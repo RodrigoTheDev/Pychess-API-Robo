@@ -55,9 +55,7 @@ def send_motor_command(command: str):
     
     #time.sleep(2)
 
-while True:
-    comando = input("Digite o comando (mandar)")
-    if comando == "mandar":
+def exampleMove():
         #INSTRUÇÕES:
         send_motor_command("F Y 3000")
         send_motor_command("F X 4500")
@@ -77,5 +75,5 @@ while True:
         send_servo_command("close")
         send_motor_command("B X 4700")
         send_motor_command("B E0 1000")
+        send_motor_command("B E1 400")
         send_motor_command("B Y 3000")
-
